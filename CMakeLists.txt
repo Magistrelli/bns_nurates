@@ -126,6 +126,10 @@ ADD_BNSNURATES_TEST(
 test_brem
 tests/tests_brem/test_brem.cpp)
 
+ADD_BNSNURATES_EXECUTABLE(
+test_opacities_cost
+tests/tests_cost/test_opacities_cost.cpp)
+
 ADD_BNSNURATES_TEST(
 test_pair_kernels
 tests/tests_pair/test_pair_kernels.cpp)
