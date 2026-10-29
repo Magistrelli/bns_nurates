@@ -1098,6 +1098,17 @@ void AddPairBremDoubleIntegralFused(const MyQuadrature* quad, BS_REAL t,
     BS_REAL acc_n_em[total_num_species] = {0}, acc_n_ab[total_num_species] = {0};
     BS_REAL acc_e_em[total_num_species] = {0}, acc_e_ab[total_num_species] = {0};
 
+    // HR98 brem: EOS-dependent part computed once, outside the energy loops
+    BremHR98EOSTerms brem_hr98_fromEOS = {};
+    if (use_brem && brem_impl == BREM_HR98)
+    {
+        gop->kernel_pars.brem_kernel_params.l = 0;
+        gop->kernel_pars.brem_kernel_params.use_NN_medium_corr =
+            gop->opacity_pars.use_NN_medium_corr;
+        brem_hr98_fromEOS = BremHR98PrecomputeEOS(&gop->eos_pars,
+                                          gop->opacity_pars.use_NN_medium_corr);
+    }
+
     for (int a = 0; a < N2; ++a)
     {
         const int    ia    = (a < n) ? a : a - n;
@@ -1157,20 +1168,28 @@ void AddPairBremDoubleIntegralFused(const MyQuadrature* quad, BS_REAL t,
             {
                 gop->kernel_pars.brem_kernel_params.omega       = nu_a;
                 gop->kernel_pars.brem_kernel_params.omega_prime = nu_b;
-                MyKernelOutput brem_ker;
+                MyKernelOutput brem_ker = {0};
                 if (brem_impl == BREM_BRT06)
                 {
                     brem_ker = BremKernelsBRT06(&gop->kernel_pars.brem_kernel_params,
                                                 &gop->eos_pars);
                 }
+                else if (brem_impl == BREM_HR98)
+                {
+                    brem_ker = BremKernelsLegCoeffFromEOS(
+                        &gop->kernel_pars.brem_kernel_params, &brem_hr98_fromEOS);
+                }
+                else if (brem_impl == BREM_GP19)
+                {
+                    brem_ker = BremKernelAbsGP19(&gop->kernel_pars.brem_kernel_params,
+                                                &gop->eos_pars);
+                }
                 else
                 {
-                    gop->kernel_pars.brem_kernel_params.l = 0;
-                    gop->kernel_pars.brem_kernel_params.use_NN_medium_corr =
-                        gop->opacity_pars.use_NN_medium_corr;
-                    brem_ker = BremKernelsLegCoeff(&gop->kernel_pars.brem_kernel_params,
-                                                   &gop->eos_pars);
+                    BS_ASSERT(false, "Unknown bremsstrahlung implementation: %d",
+                              (int)brem_impl);
                 }
+
                 for (int s = 0; s < total_num_species; ++s)
                 {
                     em_ab[s] += brem_ker.em[0];  ab_ab[s] += brem_ker.abs[0];
@@ -1927,6 +1946,19 @@ ComputeM1OpacitiesNonThermalSeparated(
 }
 
 
+/* SpectralIntegrandParams struct
+ *
+ * Parameters passed to SpectralIntegrand: the opacity parameters and the
+ * EOS-dependent part of the HR98 brem kernel, computed once per spectral
+ * opacity evaluation (see ComputeSpectralOpacitiesNotStimulatedAbs)
+ */
+struct SpectralIntegrandParams
+{
+    GreyOpacityParams grey_pars;
+    BremHR98EOSTerms brem_hr98_fromEOS;
+};
+typedef struct SpectralIntegrandParams SpectralIntegrandParams;
+
 /* Compute the integrands for the computation of the spectral emissivity and
  * inverse mean free path */
 KOKKOS_INLINE_FUNCTION
@@ -1938,7 +1970,8 @@ MyQuadratureIntegrand SpectralIntegrand(BS_REAL* var, void* p)
     // energies and parameters
     BS_REAL nu_bar = var[0]; // [MeV]
 
-    GreyOpacityParams* my_grey_opacity_params = (GreyOpacityParams*)p;
+    SpectralIntegrandParams* spectral_params  = (SpectralIntegrandParams*)p;
+    GreyOpacityParams* my_grey_opacity_params = &spectral_params->grey_pars;
     MyEOSParams my_eos_params  = my_grey_opacity_params->eos_pars;
     OpacityFlags opacity_flags = my_grey_opacity_params->opacity_flags;
     OpacityParams opacity_pars = my_grey_opacity_params->opacity_pars;
@@ -1990,13 +2023,9 @@ MyQuadratureIntegrand SpectralIntegrand(BS_REAL* var, void* p)
         }
         else if (opacity_pars.brem_implementation == BREM_HR98)
         {
-            my_grey_opacity_params->kernel_pars.brem_kernel_params.l = 0;
-            my_grey_opacity_params->kernel_pars.brem_kernel_params
-                .use_NN_medium_corr =
-                my_grey_opacity_params->opacity_pars.use_NN_medium_corr;
-            brem_kernels_m1 = BremKernelsLegCoeff(
+            brem_kernels_m1 = BremKernelsLegCoeffFromEOS(
                 &my_grey_opacity_params->kernel_pars.brem_kernel_params,
-                &my_eos_params);
+                &spectral_params->brem_hr98_fromEOS);
         }
         else if (opacity_pars.brem_implementation == BREM_GP19)
         {
@@ -2132,15 +2161,29 @@ SpectralOpacities ComputeSpectralOpacitiesNotStimulatedAbs(
     my_grey_opacity_params->kernel_pars.brem_kernel_params.omega      = nu;
     my_grey_opacity_params->kernel_pars.inelastic_kernel_params.omega = nu;
 
-    GreyOpacityParams local_grey_params = *my_grey_opacity_params;
-    local_grey_params.opacity_flags.use_inelastic_scatt = 0;
+    SpectralIntegrandParams local_params;
+    local_params.grey_pars = *my_grey_opacity_params;
+    local_params.grey_pars.opacity_flags.use_inelastic_scatt = 0;
+
+    // HR98 brem: EOS-dependent part computed once, outside the 1d integration
+    local_params.brem_hr98_fromEOS = {};
+    if (local_params.grey_pars.opacity_flags.use_brem == 1 &&
+        local_params.grey_pars.opacity_pars.brem_implementation == BREM_HR98)
+    {
+        local_params.grey_pars.kernel_pars.brem_kernel_params.l = 0;
+        local_params.grey_pars.kernel_pars.brem_kernel_params.use_NN_medium_corr =
+            local_params.grey_pars.opacity_pars.use_NN_medium_corr;
+        local_params.brem_hr98_fromEOS = BremHR98PrecomputeEOS(
+            &local_params.grey_pars.eos_pars,
+            local_params.grey_pars.opacity_pars.use_NN_medium_corr);
+    }
 
     // set up 1d integration
     MyFunctionMultiD integrand_m1_1d;
     MyQuadratureIntegrand integrand_m1_1d_info = {.n = 8};
     integrand_m1_1d.function                   = &SpectralIntegrand;
     integrand_m1_1d.dim                        = 1;
-    integrand_m1_1d.params                     = &local_grey_params;
+    integrand_m1_1d.params                     = &local_params;
     integrand_m1_1d.my_quadrature_integrand    = integrand_m1_1d_info;
 
     // compute the neutrino & anti-neutrino distribution function
@@ -2176,9 +2219,9 @@ SpectralOpacities ComputeSpectralOpacitiesNotStimulatedAbs(
     MyQuadratureIntegrand integrals_neps_1d = {0};
     if (my_grey_opacity_params->opacity_flags.use_inelastic_scatt == 1)
     {
-        local_grey_params.opacity_flags                     = {0};
-        local_grey_params.opacity_flags.use_inelastic_scatt = 1;
-        integrand_m1_1d.params = &local_grey_params;
+        local_params.grey_pars.opacity_flags                     = {0};
+        local_params.grey_pars.opacity_flags.use_inelastic_scatt = 1;
+        integrand_m1_1d.params = &local_params;
         integrals_neps_1d =
             GaussLegendreIntegrate1D(quad_1d, &integrand_m1_1d, s_neps);
     }
